@@ -1,0 +1,101 @@
+"""
+generate_data.py
+-----------------
+Creates two synthetic CSV files so the whole TuneFinder project runs
+end-to-end WITHOUT needing to download anything from Kaggle/Spotify:
+
+  1. songs.csv    -> song catalogue with audio features (content-based filtering)
+  2. ratings.csv  -> synthetic user listening history (collaborative filtering)
+
+If you want to use REAL data instead, just replace songs.csv with the
+Kaggle "Spotify Dataset" (keep the same column names) and ratings.csv
+with a real user-song interaction log.
+"""
+
+import numpy as np
+import pandas as pd
+
+np.random.seed(42)
+
+GENRES = ["Pop", "Rock", "Hip-Hop", "Electronic", "Jazz", "Classical", "R&B", "Country"]
+ADJECTIVES = ["Midnight", "Golden", "Broken", "Electric", "Silent", "Wild", "Neon", "Velvet",
+              "Crimson", "Hollow", "Sunset", "Restless", "Amber", "Fading", "Reckless"]
+NOUNS = ["Dreams", "Highway", "Heart", "Skyline", "Echoes", "Fire", "Rain", "Horizon",
+         "Whispers", "Shadows", "Lights", "Journey", "Waves", "Static", "Bloom"]
+ARTISTS = [f"Artist {chr(65+i)}" for i in range(26)]
+
+N_SONGS = 300
+N_USERS = 150
+
+
+def generate_songs(n=N_SONGS) -> pd.DataFrame:
+    rows = []
+    for i in range(n):
+        genre = np.random.choice(GENRES)
+
+        # Give each genre a rough "personality" so similarity search feels meaningful
+        genre_profile = {
+            "Pop":        dict(energy=0.75, dance=0.75, valence=0.70, acoustic=0.15, tempo=118),
+            "Rock":       dict(energy=0.85, dance=0.45, valence=0.55, acoustic=0.10, tempo=128),
+            "Hip-Hop":    dict(energy=0.70, dance=0.80, valence=0.55, acoustic=0.08, tempo=95),
+            "Electronic": dict(energy=0.80, dance=0.85, valence=0.60, acoustic=0.05, tempo=126),
+            "Jazz":       dict(energy=0.40, dance=0.45, valence=0.50, acoustic=0.70, tempo=100),
+            "Classical":  dict(energy=0.25, dance=0.20, valence=0.40, acoustic=0.95, tempo=90),
+            "R&B":        dict(energy=0.55, dance=0.65, valence=0.50, acoustic=0.25, tempo=90),
+            "Country":    dict(energy=0.55, dance=0.50, valence=0.60, acoustic=0.45, tempo=110),
+        }[genre]
+
+        def jitter(val, spread=0.15):
+            return float(np.clip(val + np.random.normal(0, spread), 0, 1))
+
+        song = {
+            "song_id": i,
+            "title": f"{np.random.choice(ADJECTIVES)} {np.random.choice(NOUNS)}",
+            "artist": np.random.choice(ARTISTS),
+            "genre": genre,
+            "danceability": jitter(genre_profile["dance"]),
+            "energy": jitter(genre_profile["energy"]),
+            "valence": jitter(genre_profile["valence"]),
+            "acousticness": jitter(genre_profile["acoustic"]),
+            "tempo": float(np.clip(genre_profile["tempo"] + np.random.normal(0, 12), 60, 200)),
+            "loudness": float(np.clip(np.random.normal(-7, 3), -20, 0)),
+            "popularity": int(np.clip(np.random.normal(50, 20), 0, 100)),
+        }
+        rows.append(song)
+    return pd.DataFrame(rows)
+
+
+def generate_ratings(songs: pd.DataFrame, n_users=N_USERS) -> pd.DataFrame:
+    """Each synthetic user has 1-3 favorite genres and rates songs accordingly,
+    so collaborative filtering has real signal to learn from."""
+    rows = []
+    for user_id in range(n_users):
+        n_fav_genres = np.random.randint(1, 3)
+        fav_genres = np.random.choice(GENRES, size=n_fav_genres, replace=False)
+
+        liked_songs = songs[songs["genre"].isin(fav_genres)]
+        other_songs = songs[~songs["genre"].isin(fav_genres)]
+
+        n_liked = min(len(liked_songs), np.random.randint(10, 25))
+        n_other = min(len(other_songs), np.random.randint(2, 8))
+
+        for _, song in liked_songs.sample(n_liked, random_state=user_id).iterrows():
+            rating = np.clip(np.random.normal(4.3, 0.7), 1, 5)
+            rows.append((user_id, song["song_id"], round(rating, 1)))
+
+        for _, song in other_songs.sample(n_other, random_state=user_id + 999).iterrows():
+            rating = np.clip(np.random.normal(2.5, 0.9), 1, 5)
+            rows.append((user_id, song["song_id"], round(rating, 1)))
+
+    return pd.DataFrame(rows, columns=["user_id", "song_id", "rating"])
+
+
+if __name__ == "__main__":
+    songs_df = generate_songs()
+    ratings_df = generate_ratings(songs_df)
+
+    songs_df.to_csv("songs.csv", index=False)
+    ratings_df.to_csv("ratings.csv", index=False)
+
+    print(f"songs.csv   -> {len(songs_df)} rows")
+    print(f"ratings.csv -> {len(ratings_df)} rows")

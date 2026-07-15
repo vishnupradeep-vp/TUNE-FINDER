@@ -1,0 +1,178 @@
+"""
+recommend.py
+------------
+Two recommendation strategies:
+
+1. ContentBasedRecommender
+   Recommends songs whose AUDIO FEATURES (danceability, energy, tempo, etc.)
+   are most similar to a given song, using cosine similarity.
+   Works even for brand-new songs with no listening history ("cold start" OK).
+
+2. CollaborativeRecommender
+   Recommends songs based on patterns in what OTHER USERS with similar taste
+   have rated highly, using matrix factorization (truncated SVD).
+   Needs historical rating data, but can surface non-obvious recommendations
+   content-based filtering would miss.
+
+3. HybridRecommender
+   Simple weighted blend of both.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
+from sklearn.metrics.pairwise import cosine_similarity
+
+from src.preprocess import FEATURE_COLUMNS, load_ratings, load_songs, scale_features
+
+
+class ContentBasedRecommender:
+    def __init__(self, songs_df: pd.DataFrame):
+        self.songs = songs_df.reset_index(drop=True)
+        scaled = scale_features(self.songs)
+        self.feature_matrix = scaled[FEATURE_COLUMNS].values
+        self.similarity = cosine_similarity(self.feature_matrix)
+        self._id_to_idx = {sid: i for i, sid in enumerate(self.songs["song_id"])}
+
+    def recommend(self, song_id: int, top_n: int = 10) -> pd.DataFrame:
+        if song_id not in self._id_to_idx:
+            raise ValueError(f"song_id {song_id} not found")
+
+        idx = self._id_to_idx[song_id]
+        scores = list(enumerate(self.similarity[idx]))
+        scores = sorted(scores, key=lambda x: x[1], reverse=True)
+        # skip index 0 -> that's the song itself (similarity == 1.0)
+        top = scores[1:top_n + 1]
+
+        result = self.songs.iloc[[i for i, _ in top]].copy()
+        result["similarity"] = [round(s, 3) for _, s in top]
+        return result.reset_index(drop=True)
+
+    def recommend_by_title(self, title: str, top_n: int = 10) -> pd.DataFrame:
+        match = self.songs[self.songs["title"].str.lower() == title.lower()]
+        if match.empty:
+            raise ValueError(f"No song titled '{title}' found")
+        return self.recommend(match.iloc[0]["song_id"], top_n)
+
+
+class CollaborativeRecommender:
+    """Matrix-factorization based collaborative filtering using truncated SVD.
+    (A lightweight alternative to the `surprise` library -- pure scipy/numpy,
+    so it installs cleanly everywhere.)"""
+
+    def __init__(self, ratings_df: pd.DataFrame, songs_df: pd.DataFrame, n_factors: int = 20):
+        self.songs = songs_df.reset_index(drop=True)
+        self.ratings = ratings_df
+
+        self.user_ids = sorted(ratings_df["user_id"].unique())
+        self.song_ids = sorted(songs_df["song_id"].unique())
+        self._user_to_idx = {u: i for i, u in enumerate(self.user_ids)}
+        self._song_to_idx = {s: i for i, s in enumerate(self.song_ids)}
+
+        matrix = csr_matrix(
+            (
+                ratings_df["rating"],
+                (
+                    ratings_df["user_id"].map(self._user_to_idx),
+                    ratings_df["song_id"].map(self._song_to_idx),
+                ),
+            ),
+            shape=(len(self.user_ids), len(self.song_ids)),
+        )
+
+        self.user_means = np.array(matrix.sum(axis=1)).flatten() / np.maximum(
+            (matrix != 0).sum(axis=1).A1, 1
+        )
+        dense = matrix.toarray().astype(float)
+        mask = dense != 0
+        normalized = dense - self.user_means[:, None] * mask
+
+        k = min(n_factors, min(normalized.shape) - 1)
+        U, sigma, Vt = svds(normalized, k=k)
+        sigma = np.diag(sigma)
+
+        self.predicted = U @ sigma @ Vt + self.user_means[:, None]
+
+    def recommend(self, user_id: int, top_n: int = 10) -> pd.DataFrame:
+        if user_id not in self._user_to_idx:
+            raise ValueError(f"user_id {user_id} not found")
+
+        u_idx = self._user_to_idx[user_id]
+        pred_scores = self.predicted[u_idx]
+
+        already_rated = set(
+            self.ratings.loc[self.ratings["user_id"] == user_id, "song_id"]
+        )
+
+        candidates = [
+            (self.song_ids[i], score)
+            for i, score in enumerate(pred_scores)
+            if self.song_ids[i] not in already_rated
+        ]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        top = candidates[:top_n]
+
+        top_ids = [sid for sid, _ in top]
+        result = self.songs[self.songs["song_id"].isin(top_ids)].copy()
+        score_map = dict(top)
+        result["predicted_rating"] = result["song_id"].map(score_map).round(2)
+        return result.sort_values("predicted_rating", ascending=False).reset_index(drop=True)
+
+
+class HybridRecommender:
+    """Blends content-based similarity with collaborative predicted rating."""
+
+    def __init__(self, content_model: ContentBasedRecommender,
+                 collab_model: CollaborativeRecommender, alpha: float = 0.5):
+        self.content_model = content_model
+        self.collab_model = collab_model
+        self.alpha = alpha  # weight given to content-based score
+
+    def recommend(self, user_id: int, seed_song_id: int, top_n: int = 10) -> pd.DataFrame:
+        content = self.content_model.recommend(seed_song_id, top_n=50)
+        collab = self.collab_model.recommend(user_id, top_n=50)
+
+        merged = content.merge(
+            collab[["song_id", "predicted_rating"]], on="song_id", how="outer"
+        )
+        merged["similarity"] = merged["similarity"].fillna(0)
+        merged["predicted_rating"] = merged["predicted_rating"].fillna(
+            merged["predicted_rating"].mean()
+        )
+
+        # normalize predicted_rating to 0-1 so it's comparable to similarity
+        pr = merged["predicted_rating"]
+        merged["predicted_rating_norm"] = (pr - pr.min()) / (pr.max() - pr.min() + 1e-9)
+
+        merged["hybrid_score"] = (
+            self.alpha * merged["similarity"]
+            + (1 - self.alpha) * merged["predicted_rating_norm"]
+        )
+        merged = merged.dropna(subset=["title"])
+        return merged.sort_values("hybrid_score", ascending=False).head(top_n).reset_index(drop=True)
+
+
+if __name__ == "__main__":
+    songs = load_songs("data/songs.csv")
+    ratings = load_ratings("data/ratings.csv")
+
+    print("=== Content-Based Demo ===")
+    cb = ContentBasedRecommender(songs)
+    sample_song = songs.iloc[0]
+    print(f"Because you liked: {sample_song['title']} ({sample_song['genre']})\n")
+    print(cb.recommend(sample_song["song_id"], top_n=5)[["title", "artist", "genre", "similarity"]])
+
+    print("\n=== Collaborative Filtering Demo ===")
+    cf = CollaborativeRecommender(ratings, songs)
+    sample_user = ratings["user_id"].iloc[0]
+    print(f"Recommended for user {sample_user}:\n")
+    print(cf.recommend(sample_user, top_n=5)[["title", "artist", "genre", "predicted_rating"]])
+
+    print("\n=== Hybrid Demo ===")
+    hybrid = HybridRecommender(cb, cf)
+    print(hybrid.recommend(sample_user, sample_song["song_id"], top_n=5)[
+        ["title", "artist", "genre", "hybrid_score"]
+    ])
